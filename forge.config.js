@@ -1,6 +1,8 @@
 module.exports = {
   packagerConfig: {
     asar: true,
+    icon: 'assets/tomato',
+    extraResource: ['dist']
   },
   rebuildConfig: {},
   makers: [

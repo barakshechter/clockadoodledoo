@@ -1,13 +1,17 @@
-const { app, BrowserWindow, dialog} = require('electron');
-const path = require('path');
+const { app, dialog, BrowserWindow } = require('electron');
 const PomodoroTray = require("./app/pomodoro");
 const { Clockify } = require("./lib/clockify");
 const settings = require('electron-settings');
 const prompt = require("custom-electron-prompt");
+const _ = require('lodash')
+const path = require("path");
+
+let pomodoro;
 
 let mainWindow = null;
+const is = { development: process.env.NODE_ENV === 'development'}
+
 const createMainWindow = () => {
-  const is = { development: true }
   mainWindow = new BrowserWindow({
     backgroundColor: '#FFF',
     width: 300,
@@ -26,12 +30,13 @@ const createMainWindow = () => {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
     mainWindow.loadURL('http://localhost:5173');
   } else {
-    mainWindow.loadURL(`file://${path.join(__dirname, '../../dist/index.html')}`);
+    mainWindow.loadURL(`file://${path.join(process.resourcesPath, 'dist/index.html')}`);
   }
 };
 
+
 app.whenReady().then(async () => {
-  createMainWindow()
+  createMainWindow();
 
   let apiKey = await settings.get('clockify.apiKey');
   if (!apiKey) {
@@ -60,15 +65,18 @@ app.whenReady().then(async () => {
 
   const clockify = new Clockify(apiKey);
 
-  const user = await clockify.whoami();
+  const user = await clockify.whoami().catch((e) => {
+    console.log(`Error getting user: ${_.get(e, 'response.data.message') || e}`)
+  });
   const userId = await settings.get('user.id');
-  if (user.id !== userId) {
+  if ((user || {}).id !== userId) {
     await settings.reset();
-    await settings.set('user', user)
+    apiKey && await settings.set('clockify', { apiKey })
+    user && await settings.set('user', user)
   }
 
-  const pomodoroTray = new PomodoroTray(clockify);
-  await pomodoroTray.start()
+  pomodoro = new PomodoroTray(clockify);
+  await pomodoro.start()
 })
 
 app.dock.hide();

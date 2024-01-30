@@ -8,38 +8,48 @@ class Pomodoro {
   constructor(clockify, refreshInterval = 5000) {
     this.tray = null;
     this.refreshInterval = refreshInterval;
-    this.pauseRefresh = false;
+    this.started = false;
     this.clockify = clockify;
   }
 
   start = async () => {
+    this.started = true;
     await this.refreshMenu();
 
-    this.timerInterval = setInterval(
-      async () => {
-        if (this.pauseRefresh) {
-          return;
-        }
-        const workspaceId = await settings.get('workspace.id')
-        const userId = await settings.get('user.id')
-
-        let title = ''
-        if (workspaceId && userId) {
-          const entry = await this.clockify.getActiveTimeEntry(workspaceId, userId)
-          if (entry) {
-            const project = (await this.clockify.getProjects(workspaceId)).find(p => p.id === entry.projectId);
-            const startDate = new Date(entry.timeInterval.start);
-            title = ` ${toTimeString(Date.now() - startDate)} - ${project.clientName}`;
-          }
-        }
-
-        this.tray.setTitle(title);
-      },
+    this.trayTextUpdateInterval = setInterval(
+      this.updateTrayText.bind(this),
       1000
     )
 
-    this.menuInterval = setInterval(() => this.refreshMenu(), this.refreshInterval)
+    this.menuRefreshInterval = setInterval(this.refreshMenu.bind(this), this.refreshInterval)
   };
+
+  stop = () => {
+    this.started = false;
+    clearInterval(this.trayTextUpdateInterval);
+    clearInterval(this.menuRefreshInterval);
+  }
+
+  async updateTrayText(force) {
+    if (!this.started && !force) {
+      return;
+    }
+
+    let title = ''
+
+    const workspaceId = await settings.get('workspace.id')
+    const userId = await settings.get('user.id')
+    if (workspaceId && userId) {
+      const entry = await this.clockify.getActiveTimeEntry(workspaceId, userId)
+      if (entry) {
+        const project = (await this.clockify.getProjects(workspaceId)).find(p => p.id === entry.projectId);
+        const startDate = new Date(entry.timeInterval.start);
+        title = ` ${toTimeString(Date.now() - startDate)} - ${project.clientName}`;
+      }
+    }
+
+    this.tray.setTitle(title);
+  }
 
   async getWorkspacesMenu() {
     const workspaces = await this.clockify.listWorkspaces();
@@ -68,7 +78,6 @@ class Pomodoro {
 
   async appendProjects(menu) {
     const _this = this;
-    const refreshMenu = this.refreshMenu.bind(this);
     const workspaceId = await settings.get('workspace.id');
     if (!workspaceId) {
       return;
@@ -83,52 +92,44 @@ class Pomodoro {
       if (entry) {
         const activeEntryMenu = menu; //new Menu();
 
-        const project = projects.find(p => p.id === entry.projectId);
+        const project = projects.find(p => p.id === entry.projectId) || {};
         const startDate = new Date(entry.timeInterval.start);
         const formattedStartDate = Date.now() - startDate > 1000 * 3600 * 12
           ? startDate.toLocaleString() : startDate.toLocaleTimeString();
 
         menu.append(new MenuItem({
-          label: `${project.name} (${project.clientName}) - Started at ${formattedStartDate}`,
+          label: `${project.name || 'No project'} (${project.clientName || 'No client'}) - Started at ${formattedStartDate}`,
           enabled: false, submenu: undefined,
           toolTip: entry.description
         }));
 
         if (entry.description) {
           menu.append(new MenuItem({
-            label: entry.description, enabled: false, submenu: undefined,
+            label: entry.description.replace(/&/g, '&&'), enabled: false, submenu: undefined,
           }));
         }
 
         menu.append(new MenuItem({
           label: entry.description ? 'Update description' : 'Add description',
-          async click() {
-            try {
-              const description = await prompt({
-                title: 'Update Description',
-                value: entry.description,
-                label: ' ',
-                type: 'input'
-              })
-              if (description !== null) {
-                await this.clockify.updateActiveTimeEntry(workspaceId, userId, {
-                  description
-                })
-              }
-            } catch (e) {
-              dialog.showMessageBoxSync({
-                type: 'error',
-                message: e.message,
-                detail: e.response ? JSON.stringify(e.response.data, undefined, 2) : undefined,
-                title: 'Error updating time entry.'
-              })
-            }
-          }
+          click: () => _this.updateDescription()
         }));
+
+        const lastTimeEntries = await this.clockify.getLastTimeEntries(workspaceId, userId, project.id) || [];
+        const descriptions = lastTimeEntries
+          .map(({description}) => description)
+          .filter(d => _.trim(d) && d !== entry.description);
+
+        menu.append(new MenuItem({
+          label: "Set Description",
+          submenu: _.uniq(descriptions).map(d => ({
+              label: d,
+              click: () => _this.updateDescription(d)
+          }))
+        }))
 
         activeEntryMenu.append(new MenuItem({label: 'Stop Timer',
           async click() {
-            _this.pauseRefresh = true;
+            await _this.stop();
             try {
               await _this.clockify.stopCurrentTimeEntry(workspaceId, userId);
             } catch (e) {
@@ -139,17 +140,18 @@ class Pomodoro {
                 title: 'Error starting new time entry.'
               })
             }
-            await refreshMenu(true);
+            await _this.refreshMenu(true);
+            await _this.updateTrayText(true);
           }
         }));
         const startDateNearest30 = new Date(Math.round(startDate.getTime()/1800000)*1800000)
         const startDateNearest60 = new Date(startDateNearest30 - 1800000)
         activeEntryMenu.append(new MenuItem({
           label: 'Adjust Start Time', submenu: [
-            {label: 'by -15m'},
-            {label: 'by -30m'},
-            {label: `to ${startDateNearest30.toLocaleTimeString()}`},
-            {label: `to ${startDateNearest60.toLocaleTimeString()}`},
+            {label: 'by -15m', click: () => _this.updateStartTime(new Date(startDate.getTime() - 15*60*1000))},
+            {label: 'by -30m', click: () => _this.updateStartTime(new Date(startDate.getTime() - 30*60*1000))},
+            {label: `to ${startDateNearest30.toLocaleTimeString()}`, click: () => _this.updateStartTime(startDateNearest30)},
+            {label: `to ${startDateNearest60.toLocaleTimeString()}`, click: () => _this.updateStartTime(startDateNearest60)},
           ]
         }));
       }
@@ -176,9 +178,10 @@ class Pomodoro {
           id,
           label: `${name} (${clientName})`,
           async click() {
-            _this.pauseRefresh = true;
+            await _this.stop();
             try {
               await _this.clockify.startTimeEntry(workspaceId, userId, id);
+              await _this.start();
             } catch (e) {
               dialog.showMessageBoxSync({
                 type: 'error',
@@ -187,7 +190,6 @@ class Pomodoro {
                 title: 'Error starting new time entry.'
               })
             }
-            await refreshMenu(true)
           }
         }))
       )
@@ -213,11 +215,10 @@ class Pomodoro {
   }
 
   async refreshMenu(force) {
-    if (this.pauseRefresh && !force) {
+    if (!this.started && !force) {
       return;
     }
 
-    this.pauseRefresh = false;
     const menu = new Menu();
     menu.append(new MenuItem({type: 'separator'}))
     await this.appendProjects(menu);
@@ -235,6 +236,68 @@ class Pomodoro {
     }
     this.tray.setContextMenu(menu)
   }
+
+  async updateDescription(description) {
+    try {
+      const workspaceId = await settings.get('workspace.id')
+      const userId = await settings.get('user.id')
+
+      const entry = await this.clockify.getActiveTimeEntry(workspaceId, userId);
+      if (!entry) {
+        return;
+      }
+
+      description = description || await prompt({
+        title: 'Update Description',
+        value: entry.description,
+        label: ' ',
+        type: 'input'
+      })
+      if (description !== null) {
+        await this.clockify.updateActiveTimeEntry(workspaceId, userId, {
+          description
+        })
+      }
+    } catch (e) {
+      dialog.showMessageBoxSync({
+        type: 'error',
+        message: e.message,
+        detail: e.response ? JSON.stringify(e.response.data, undefined, 2) : undefined,
+        title: 'Error updating time entry.'
+      })
+    }
+  }
+  async updateStartTime(start) {
+    try {
+      const workspaceId = await settings.get('workspace.id')
+      const userId = await settings.get('user.id')
+
+      const entry = await this.clockify.getActiveTimeEntry(workspaceId, userId);
+      if (!entry) {
+        return;
+      }
+      const previousEntries = await this.clockify.getLastTimeEntries(workspaceId, userId, null);
+      const previousStart = new Date(entry.timeInterval.start);
+      const stoppedEntry = previousEntries.find(e => e.timeInterval.end && Math.abs(new Date(e.timeInterval.end) - previousStart) < 1000);
+
+      // Only adjust start times by more than 1 minute.
+      if (Math.abs(previousStart - start) < 60*1000) {
+        return;
+      }
+      if (start) {
+        await this.clockify.updateActiveTimeEntry(workspaceId, userId, { start })
+        stoppedEntry && await this.clockify.updateTimeEntry(workspaceId, stoppedEntry, { end: start })
+      }
+    } catch (e) {
+      dialog.showMessageBoxSync({
+        type: 'error',
+        message: e.message,
+        detail: e.response ? JSON.stringify(e.response.data, undefined, 2) : undefined,
+        title: 'Error updating time entry.'
+      })
+    }
+  }
+
 }
 
 module.exports = Pomodoro;
